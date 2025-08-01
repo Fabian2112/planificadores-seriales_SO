@@ -51,6 +51,10 @@ t_list* timers_suspension; // Lista de timers de suspensión activos
 // Variable para tracking del proceso actual en syscall
 static int pid_proceso_actual = -1;
 
+// Variable para pausar temporalmente el planificador automático
+static bool planificador_pausado = false;
+static pthread_mutex_t mutex_planificador_pausado = PTHREAD_MUTEX_INITIALIZER;
+
 
 // Funciones auxiliares para el planificador
 t_cpu_conectada* buscar_cpu_libre() {
@@ -65,7 +69,11 @@ t_cpu_conectada* buscar_cpu_libre() {
     
     for (int i = 0; i < total_cpus; i++) {
         t_cpu_conectada* cpu = list_get(lista_cpus_conectadas, i);
-        log_trace(kernel_logger, "CPU ID %d - Libre: %s", cpu->id_cpu, cpu->esta_libre ? "SÍ" : "NO");
+        log_trace(kernel_logger, "[DEBUG] CPU %d - Libre: %s, Proceso: %s (PID: %d)", 
+                 cpu->id_cpu, 
+                 cpu->esta_libre ? "SÍ" : "NO",
+                 cpu->proceso_en_exec ? "OCUPADA" : "LIBRE",
+                 cpu->proceso_en_exec ? cpu->proceso_en_exec->pid : -1);
         if (cpu->esta_libre) {
             log_info(kernel_logger, "CPU libre encontrada - ID: %d", cpu->id_cpu);
             return cpu;
@@ -591,8 +599,10 @@ void* servidor_io_thread(void* arg) {
 
 // Mover proceso de BLOCKED a READY (integración con planificador)
 void mover_proceso_blocked_a_ready(t_pcb* proceso) {
+    log_info(kernel_logger, "[DEADLOCK DEBUG] Intentando lock mutex_blocked en mover_proceso_blocked_a_ready");
     pthread_mutex_lock(&mutex_blocked);
-    
+    log_info(kernel_logger, "[DEADLOCK DEBUG] mutex_blocked lockeado en mover_proceso_blocked_a_ready");
+
     // Remover de cola BLOCKED
     bool encontrado = false;
     for (int i = 0; i < list_size(cola_blocked); i++) {
@@ -603,20 +613,23 @@ void mover_proceso_blocked_a_ready(t_pcb* proceso) {
             break;
         }
     }
-    
+
+    log_info(kernel_logger, "[DEADLOCK DEBUG] Intentando unlock mutex_blocked en mover_proceso_blocked_a_ready");
     pthread_mutex_unlock(&mutex_blocked);
-    
+    log_info(kernel_logger, "[DEADLOCK DEBUG] mutex_blocked desbloqueado en mover_proceso_blocked_a_ready");
+
     if (encontrado) {
-        // Agregar a cola READY
+        log_info(kernel_logger, "[DEADLOCK DEBUG] Intentando lock mutex_ready en mover_proceso_blocked_a_ready");
         pthread_mutex_lock(&mutex_ready);
+        log_info(kernel_logger, "[DEADLOCK DEBUG] mutex_ready lockeado en mover_proceso_blocked_a_ready");
         proceso->estado = READY;
         list_add(cola_ready, proceso);
         pthread_mutex_unlock(&mutex_ready);
-        
+        log_info(kernel_logger, "[DEADLOCK DEBUG] mutex_ready desbloqueado en mover_proceso_blocked_a_ready");
         log_info(kernel_logger, "Proceso PID %d: BLOCKED → READY", proceso->pid);
-        
         // Señalar al planificador que hay procesos listos
-        //sem_post(&sem_procesos_ready);
+        sem_post(&hay_procesos_ready);
+        log_info(kernel_logger, "[PLANI CORTO] sem_post(&hay_procesos_ready) realizado (BLOCKED→READY)");
     }
 }
 
@@ -755,6 +768,7 @@ int main(int argc, char* argv[]) {
         log_info(kernel_logger, "Creado hilo de CPU Interrupt");
     }
     
+
     // INICIAR PLANIFICADOR DE CORTO PLAZO EN HILO INDEPENDIENTE
     pthread_t hilo_planificador_corto;
     log_info(kernel_logger, "Iniciando planificador de corto plazo...");
@@ -764,22 +778,36 @@ int main(int argc, char* argv[]) {
     } else {
         log_info(kernel_logger, "Creado hilo de planificador corto plazo");
     }
-    
+
+
+    // Inicializar planificador largo plazo ANTES de crear el hilo
+    plani_lp = iniciar_planificador_largo_plazo();
+    log_info(kernel_logger, "Planificador Largo Plazo en estado: %s", plani_lp->estado);
+
+    // INICIAR PLANIFICADOR DE LARGO PLAZO EN HILO INDEPENDIENTE
+    extern void* planificar_procesos_en_new();
+    pthread_t hilo_planificador_largo;
+    log_info(kernel_logger, "Iniciando planificador de largo plazo...");
+    if (pthread_create(&hilo_planificador_largo, NULL, planificar_procesos_en_new, NULL) != 0) {
+        log_error(kernel_logger, "Error al crear hilo de planificador largo plazo");
+        exit(EXIT_FAILURE);
+    } else {
+        log_info(kernel_logger, "Creado hilo de planificador largo plazo");
+    }
+
     // Dar tiempo para que los servidores se inicien
     usleep(100000); // 100ms
-    
+
     t_proceso_kernel* proceso = crear_proceso(nombre_archivo,tamanio_archivo);
     if (proceso == NULL) {
         log_error(kernel_logger, "Error al crear proceso inicial");
         exit(EXIT_FAILURE);
     }
-    
-    plani_lp = iniciar_planificador_largo_plazo();
-    
-    log_info(kernel_logger, "Planificador Largo Plazo en estado: %s", plani_lp->estado);
+    enviar_proceso(memoria, proceso);
+
     log_info(kernel_logger, "Presione ENTER para iniciar la planificación...");
     getchar();
-    
+
     free(plani_lp->estado);
     plani_lp->estado = strdup("INICIADO");
     plani_lp->activo = true;
@@ -790,13 +818,13 @@ int main(int argc, char* argv[]) {
     // El servidor CPU ya está corriendo en hilo independiente
     // Esperar a que termine (o implementar lógica de shutdown)
     log_info(kernel_logger, "Planificación completada, CPU servidor corriendo...");
-    
+
     // Esperar ambos hilos
     pthread_join(hilo_cpu_dispatch, NULL);
     pthread_join(hilo_planificador_corto, NULL);
+    pthread_join(hilo_planificador_largo, NULL);
     destruir_colas();
 
-    
     log_debug(kernel_logger,"Se ha desconectado de kernel");
 
     printf("\nKERNEL DESCONECTADO!\n\n");
@@ -855,7 +883,7 @@ void* atender_cpu_dispatch() {
     sem_post(&sem_servidor_cpu_listo);
     
     int fd_cpu_dispatch = esperar_cliente(kernel_logger, fd_kernel_dispatch);
-    if (fd_kernel_dispatch < 0) {
+    if (fd_cpu_dispatch < 0) {
         log_error(kernel_logger, "Error al aceptar cliente de cpu_dispatch");
         return NULL;
     }
@@ -888,79 +916,110 @@ void* atender_cpu_dispatch() {
     bool cpu_conectado = true;
     // Bucle principal de atención a syscalls
     while (cpu_conectado) {
-        log_info(kernel_logger, "Esperando syscall de CPU...");
-
+        log_info(kernel_logger, "[SYSCALL DEBUG] Esperando syscall de CPU...");
+        sleep(1);
         int cod_op = recibir_operacion(kernel_logger, fd_cpu_dispatch);
+        log_info(kernel_logger, "[SYSCALL DEBUG] Recibido código de operación: %d", cod_op);
 
         switch(cod_op) {
             case -1:
                 log_error(kernel_logger, "CPU se desconectó");
-                
-                // Remover CPU de la lista de CPUs conectadas
-                pthread_mutex_lock(&mutex_cpus);
-                for (int i = 0; i < list_size(lista_cpus_conectadas); i++) {
-                    t_cpu_conectada* cpu = list_get(lista_cpus_conectadas, i);
-                    if (cpu->socket_dispatch == fd_cpu_dispatch) {
-                        list_remove(lista_cpus_conectadas, i);
-                        log_info(kernel_logger, "CPU ID %d removida de la lista. CPUs restantes: %d", 
-                                 cpu->id_cpu, list_size(lista_cpus_conectadas));
-                        free(cpu);
-                        break;
-                    }
-                }
-                pthread_mutex_unlock(&mutex_cpus);
-                
-                cpu_conectado = false;
+    log_info(kernel_logger, "[PLANI CORTO] Iniciando hilo planificador de corto plazo");
+    while (1) {
+        log_info(kernel_logger, "[PLANI CORTO] Esperando procesos en READY...");
+        sem_wait(&hay_procesos_ready);
+        log_info(kernel_logger, "[PLANI CORTO] Despertado por semáforo, revisando cola READY");
+        pthread_mutex_lock(&mutex_cola_ready);
+        int ready_count = list_size(cola_ready);
+        log_info(kernel_logger, "[PLANI CORTO] Cantidad de procesos en READY: %d", ready_count);
+        if (ready_count == 0) {
+            log_warning(kernel_logger, "[PLANI CORTO] Cola READY vacía tras semáforo, posible error de sincronización");
+            pthread_mutex_unlock(&mutex_cola_ready);
+            continue;
+        }
+        t_proceso_kernel* proceso = list_remove(cola_ready, 0);
+        pthread_mutex_unlock(&mutex_cola_ready);
+        log_info(kernel_logger, "[PLANI CORTO] Proceso PID=%d seleccionado para ejecutar", proceso->pcb.pid);
+        // Aquí deberías despachar el proceso a la CPU
+        // ...código de despacho...
+    }
                 break;
 
             case SYSCALL: {
-                log_info(kernel_logger, "Recibida syscall de CPU");
-                
+                log_info(kernel_logger, "[SYSCALL DEBUG] Recibida syscall de CPU, intentando lock mutex_syscall_kernel");
                 pthread_mutex_lock(&mutex_syscall_kernel);
+                log_info(kernel_logger, "[SYSCALL DEBUG] mutex_syscall_kernel lockeado");
 
+                log_info(kernel_logger, "[SYSCALL DEBUG] Llamando a recibir_paquete_desde_buffer para syscall");
                 t_list* lista = recibir_paquete_desde_buffer(kernel_logger, fd_cpu_dispatch);
+                log_info(kernel_logger, "[SYSCALL DEBUG] Recibido paquete de syscall, lista: %p, size: %d", lista, lista ? list_size(lista) : -1);
 
                 bool resultado = false;
-                
+                bool es_syscall_exit = false;
+
                 if (lista != NULL && list_size(lista) > 0) {
                     char* syscall = list_get(lista, 0);
-                    
+
                     if(syscall != NULL && strlen(syscall) > 0) {
-                        log_info(kernel_logger, "Procesando syscall: %s", syscall);
+                        log_info(kernel_logger, "[SYSCALL DEBUG] Procesando syscall: %s", syscall);
                         
-                        // Procesar la syscall
+                        // Detectar si es una syscall EXIT
+                        if (strncmp(syscall, "EXIT", 4) == 0) {
+                            es_syscall_exit = true;
+                        }
+                        
                         resultado = procesar_syscall(syscall);
-                        
-                        log_info(kernel_logger, "Syscall %s procesada: %s", 
-                                syscall, resultado ? "EXITOSA" : "ERROR");
+                        log_info(kernel_logger, "[SYSCALL DEBUG] Syscall %s procesada: %s", syscall, resultado ? "EXITOSA" : "ERROR");
                     } else {
-                        log_warning(kernel_logger, "Syscall NULL o vacía recibida");
+                        log_warning(kernel_logger, "[SYSCALL DEBUG] Syscall NULL o vacía recibida");
                     }
-                    
+
                     list_destroy_and_destroy_elements(lista, free);
                 } else {
-                    log_warning(kernel_logger, "Lista de syscall NULL o vacía");
+                    log_warning(kernel_logger, "[SYSCALL DEBUG] Lista de syscall NULL o vacía");
                     if (lista) list_destroy(lista);
                 }
 
-                // Enviar respuesta INMEDIATAMENTE
+                // Si fue una syscall EXIT exitosa, pausar planificador automático
+                if (es_syscall_exit && resultado) {
+                    pthread_mutex_lock(&mutex_planificador_pausado);
+                    planificador_pausado = true;
+                    pthread_mutex_unlock(&mutex_planificador_pausado);
+                    log_trace(kernel_logger, "[DEBUG] Planificador automático pausado para procesar EXIT");
+                }
+
                 t_paquete* paquete_respuesta;
                 if (resultado) {
                     paquete_respuesta = crear_paquete(SYSCALL_OK, kernel_logger);
-                    log_info(kernel_logger, "Enviando SYSCALL_OK al CPU");
+                    log_info(kernel_logger, "[SYSCALL DEBUG] Enviando SYSCALL_OK al CPU");
                 } else {
                     paquete_respuesta = crear_paquete(SYSCALL_ERROR, kernel_logger);
-                    log_info(kernel_logger, "Enviando SYSCALL_ERROR al CPU");
+                    log_info(kernel_logger, "[SYSCALL DEBUG] Enviando SYSCALL_ERROR al CPU");
                 }
-                
-                enviar_paquete(paquete_respuesta, fd_cpu_dispatch);
-                
-                eliminar_paquete(paquete_respuesta);
-                pthread_mutex_unlock(&mutex_syscall_kernel);
-                
-                sem_post(&sem_syscall_procesada);
 
-                log_info(kernel_logger, "Respuesta enviada al CPU, listo para próxima syscall");
+                enviar_paquete(paquete_respuesta, fd_cpu_dispatch);
+                eliminar_paquete(paquete_respuesta);
+                
+                pthread_mutex_unlock(&mutex_syscall_kernel);
+                log_info(kernel_logger, "[SYSCALL DEBUG] mutex_syscall_kernel desbloqueado");
+
+                // Si fue una syscall EXIT exitosa, replanificar DESPUÉS de enviar la respuesta
+                if (es_syscall_exit && resultado) {
+                    log_trace(kernel_logger, "[DEBUG] Post-SYSCALL_OK: esperando que CPU procese respuesta");
+                    usleep(50000); // 50ms para que CPU procese SYSCALL_OK completamente
+                    log_trace(kernel_logger, "[DEBUG] Post-SYSCALL_OK: iniciando replanificación por EXIT");
+                    replanificar_tras_devolucion("EXIT");
+                    log_trace(kernel_logger, "[DEBUG] Post-SYSCALL_OK: replanificación por EXIT completada");
+                    
+                    // Reanudar planificador automático
+                    pthread_mutex_lock(&mutex_planificador_pausado);
+                    planificador_pausado = false;
+                    pthread_mutex_unlock(&mutex_planificador_pausado);
+                    log_trace(kernel_logger, "[DEBUG] Planificador automático reanudado");
+                }
+
+                sem_post(&sem_syscall_procesada);
+                log_info(kernel_logger, "[SYSCALL DEBUG] Respuesta enviada al CPU, listo para próxima syscall");
                 break;
             }
             
@@ -1038,13 +1097,10 @@ void* atender_cpu_dispatch() {
                         // REPLANIFICACIÓN AUTOMÁTICA
                         if (!string_equals_ignore_case(motivo, "EXIT")) {
                             log_info(kernel_logger, "## Iniciando replanificación automática tras devolución");
-                            
-                            // Para SRT, verificar si hay procesos con mejor estimación esperando
+                            // Para SRT, verificar si hay procesos en READY con mejor estimación esperando
                             if (string_equals_ignore_case(ALGORITMO_CORTO_PLAZO, "SRT")) {
-                                // Verificar si hay procesos en READY con mejor estimación
                                 pthread_mutex_lock(&mutex_cola_ready);
                                 bool hay_mejor_proceso = false;
-                                
                                 if (!list_is_empty(cola_ready)) {
                                     t_proceso_kernel* primer_ready = list_get(cola_ready, 0);
                                     if (primer_ready != NULL) {
@@ -1054,16 +1110,48 @@ void* atender_cpu_dispatch() {
                                     }
                                 }
                                 pthread_mutex_unlock(&mutex_cola_ready);
-                                
                                 if (hay_mejor_proceso) {
                                     log_info(kernel_logger, "## SRT: Hay procesos esperando, iniciando planificación");
                                 }
                             }
-                            
-                            // Llamar al planificador mejorado
                             replanificar_tras_devolucion(motivo);
                         } else {
-                            log_info(kernel_logger, "## Proceso PID=%d terminó, no se requiere replanificación", pcb->pid);
+                            log_info(kernel_logger, "## Proceso PID=%d terminó, mostrando estado de colas", pcb->pid);
+                            // Mostrar PIDs de las colas principales
+                            pthread_mutex_lock(&mutex_cola_ready);
+                            int ready_count = list_size(cola_ready);
+                            log_info(kernel_logger, "[COLA READY] (%d procesos):", ready_count);
+                            for (int i = 0; i < ready_count; i++) {
+                                t_proceso_kernel* p = list_get(cola_ready, i);
+                                log_info(kernel_logger, "  READY[%d]: PID=%d", i, p->pcb.pid);
+                            }
+                            pthread_mutex_unlock(&mutex_cola_ready);
+
+                            pthread_mutex_lock(&mutex_cola_new);
+                            int new_count = list_size(cola_new);
+                            log_info(kernel_logger, "[COLA NEW] (%d procesos):", new_count);
+                            for (int i = 0; i < new_count; i++) {
+                                t_proceso_kernel* p = list_get(cola_new, i);
+                                log_info(kernel_logger, "  NEW[%d]: PID=%d", i, p->pcb.pid);
+                            }
+                            pthread_mutex_unlock(&mutex_cola_new);
+
+                            pthread_mutex_lock(&mutex_cola_susp_ready);
+                            int susp_ready_count = list_size(cola_susp_ready);
+                            log_info(kernel_logger, "[COLA SUSP_READY] (%d procesos):", susp_ready_count);
+                            for (int i = 0; i < susp_ready_count; i++) {
+                                t_proceso_kernel* p = list_get(cola_susp_ready, i);
+                                log_info(kernel_logger, "  SUSP_READY[%d]: PID=%d", i, p->pcb.pid);
+                            }
+                            pthread_mutex_unlock(&mutex_cola_susp_ready);
+
+                            // Replanificar si hay procesos en READY
+                            if (ready_count > 0) {
+                                sem_post(&hay_procesos_ready);
+                                log_info(kernel_logger, "[PLANI CORTO] sem_post(&hay_procesos_ready) realizado tras EXIT (hay %d en READY)", ready_count);
+                            } else {
+                                log_info(kernel_logger, "## No hay procesos en READY tras EXIT, esperando nuevos procesos");
+                            }
                         }
                     } else {
                         pthread_mutex_unlock(&mutex_cpus);
@@ -1604,10 +1692,43 @@ bool procesar_exit_syscall(char* syscall) {
     log_metricas_estado(pid);
     
     // Finalizar el proceso que invocó EXIT
+    log_trace(kernel_logger, "[DEBUG] ANTES de finalizar_proceso_actual()");
     finalizar_proceso_actual();
+    log_trace(kernel_logger, "[DEBUG] DESPUÉS de finalizar_proceso_actual()");
     
-    // Replanificar tras la finalización
-    replanificar_tras_devolucion("EXIT");
+    // SINCRONIZACIÓN DE SEMÁFORO: Verificar que el semáforo esté alineado con procesos READY
+    pthread_mutex_lock(&mutex_cola_ready);
+    int procesos_en_ready = list_size(cola_ready);
+    pthread_mutex_unlock(&mutex_cola_ready);
+    
+    int valor_semaforo;
+    sem_getvalue(&hay_procesos_ready, &valor_semaforo);
+    
+    log_trace(kernel_logger, "[DEBUG] POST-EXIT: %d procesos en READY, valor semáforo: %d", 
+              procesos_en_ready, valor_semaforo);
+    
+    // Si hay procesos en READY pero el semáforo está en 0, incrementarlo
+    if (procesos_en_ready > 0 && valor_semaforo == 0) {
+        log_trace(kernel_logger, "[DEBUG] CORRECCIÓN: Señalizando semáforo para %d procesos READY", procesos_en_ready);
+        for (int i = 0; i < procesos_en_ready; i++) {
+            sem_post(&hay_procesos_ready);
+        }
+    }
+    
+    // DEBUG: Verificar estado de CPUs antes de replanificación
+    pthread_mutex_lock(&mutex_cpus);
+    if (lista_cpus_conectadas != NULL) {
+        for (int i = 0; i < list_size(lista_cpus_conectadas); i++) {
+            t_cpu_conectada* cpu = list_get(lista_cpus_conectadas, i);
+            if (cpu != NULL) {
+                log_trace(kernel_logger, "[DEBUG] Pre-replanificación - CPU %d: libre=%s, proceso=%s", 
+                         cpu->id_cpu, 
+                         cpu->esta_libre ? "SÍ" : "NO",
+                         cpu->proceso_en_exec ? "OCUPADA" : "LIBRE");
+            }
+        }
+    }
+    pthread_mutex_unlock(&mutex_cpus);
     
     printf("Kernel > Proceso PID=%d finalizado exitosamente\n", pid);
     
@@ -1615,7 +1736,22 @@ bool procesar_exit_syscall(char* syscall) {
 }
 
 void planificador_corto_plazo() {
+    log_trace(kernel_logger, "[DEBUG] ENTRANDO a planificador_corto_plazo()");
+    
+    // Debug: verificar estado actual antes del sem_wait
+    pthread_mutex_lock(&mutex_cola_ready);
+    int procesos_en_ready = list_size(cola_ready);
+    pthread_mutex_unlock(&mutex_cola_ready);
+    
+    int valor_semaforo;
+    sem_getvalue(&hay_procesos_ready, &valor_semaforo);
+    
+    log_trace(kernel_logger, "[DEBUG] Antes de sem_wait: %d procesos en READY, valor semáforo: %d", 
+              procesos_en_ready, valor_semaforo);
+    
     sem_wait(&hay_procesos_ready);
+    log_trace(kernel_logger, "[DEBUG] DESPUÉS de sem_wait - semáforo desbloqueado");
+    
     pthread_mutex_lock(&mutex_cpus);
     
     log_info(kernel_logger, "## PLANIFICADOR CORTO PLAZO: Iniciando búsqueda de CPU libre");
@@ -1629,6 +1765,7 @@ void planificador_corto_plazo() {
         if (proceso == NULL) {
             pthread_mutex_unlock(&mutex_cpus);
             log_warning(kernel_logger, "No se pudo obtener proceso de READY");
+            log_trace(kernel_logger, "[DEBUG] SALIENDO de planificador_corto_plazo() (no hay proceso)");
             return;
         }
         
@@ -1653,6 +1790,8 @@ void planificador_corto_plazo() {
         agregar_pcb_a_paquete(paquete, pcb);
         enviar_paquete(paquete, cpu_libre->socket_dispatch);
         eliminar_paquete(paquete);
+
+        pid_proceso_actual = pcb->pid; // Actualizar PID del proceso actual
 /*
         t_paquete_pcb* paquete = crear_paquete_enviar(pcb);
         send(cpu_libre->socket_dispatch, &paquete, sizeof(t_paquete_pcb), 0);
@@ -1666,6 +1805,7 @@ void planificador_corto_plazo() {
             log_trace(kernel_logger, "Algoritmo %s: proceso con menor estimación (%d) asignado", 
                      ALGORITMO_CORTO_PLAZO, pcb->tiempo_estimado);
         }
+        log_trace(kernel_logger, "[DEBUG] SALIENDO de planificador_corto_plazo() (proceso asignado)");
     } else {
         // Verificar si es porque no hay CPUs conectadas o porque están ocupadas
         int total_cpus = (lista_cpus_conectadas != NULL) ? list_size(lista_cpus_conectadas) : 0;
@@ -1676,9 +1816,11 @@ void planificador_corto_plazo() {
         }
         // Devolver el semáforo ya que no se pudo asignar
         sem_post(&hay_procesos_ready);
+        log_trace(kernel_logger, "[DEBUG] SALIENDO de planificador_corto_plazo() (no hay CPU libre)");
     }
 
     pthread_mutex_unlock(&mutex_cpus);
+    log_trace(kernel_logger, "[DEBUG] SALIENDO de planificador_corto_plazo() (fin normal)");
 }
 
 // Función para ejecutar el planificador de corto plazo en bucle
@@ -1704,6 +1846,19 @@ void* planificador_corto_plazo_hilo(void* arg) {
         
         log_info(kernel_logger, "## Proceso detectado en READY - Procesos READY: %d, CPUs conectadas: %d", 
                  procesos_ready, cpus_conectadas);
+        
+        // Verificar si el planificador está pausado
+        pthread_mutex_lock(&mutex_planificador_pausado);
+        bool pausado = planificador_pausado;
+        pthread_mutex_unlock(&mutex_planificador_pausado);
+        
+        if (pausado) {
+            log_trace(kernel_logger, "## Planificador pausado temporalmente - reintentando en 10ms");
+            usleep(10000); // 10ms
+            // Volver a poner el semáforo para reintentar
+            sem_post(&hay_procesos_ready);
+            continue;
+        }
         
         if (cpus_conectadas == 0) {
             log_warning(kernel_logger, "## No hay CPUs disponibles - esperando conexiones de CPU");
@@ -2059,31 +2214,24 @@ void replanificar_tras_devolucion(char* motivo) {
     
     // Estrategia diferente según el motivo
     if (string_equals_ignore_case(motivo, "SYSCALL")) {
-        // Para syscalls, solo asignar si hay CPU libre y procesos esperando
         log_trace(kernel_logger, "Replanificación por SYSCALL: asignación simple");
         planificador_corto_plazo();
-        
-    } else if (string_equals_ignore_case(motivo, "DESALOJO") || 
-               string_equals_ignore_case(motivo, "QUANTUM")) {
-        // Para desalojos/quantum, verificar optimizaciones adicionales
+    } else if (string_equals_ignore_case(motivo, "DESALOJO") || string_equals_ignore_case(motivo, "QUANTUM")) {
         log_trace(kernel_logger, "Replanificación por %s: verificando optimizaciones", motivo);
-        
-        // Primero asignar procesos a CPUs libres
         planificador_corto_plazo();
-        
-        // Luego optimizar asignaciones si es SRT
         if (string_equals_ignore_case(ALGORITMO_CORTO_PLAZO, "SRT")) {
-            usleep(100000); // 100ms para evitar condiciones de carrera
+            usleep(100000);
             optimizar_asignacion_cpus();
         }
-        
     } else if (string_equals_ignore_case(motivo, "EXIT")) {
-        // Para EXIT, asignación normal
-        log_trace(kernel_logger, "Replanificación por EXIT: asignación normal");
+        log_trace(kernel_logger, "[DEBUG] Antes de planificador_corto_plazo() por EXIT");
         planificador_corto_plazo();
-        
+        log_trace(kernel_logger, "[DEBUG] Después de planificador_corto_plazo() por EXIT");
+        log_trace(kernel_logger, "[DEBUG] Antes de procesar_cola_new_tras_liberacion() por EXIT");
+        extern void procesar_cola_new_tras_liberacion();
+        procesar_cola_new_tras_liberacion();
+        log_trace(kernel_logger, "[DEBUG] Después de procesar_cola_new_tras_liberacion() por EXIT");
     } else {
-        // Motivo desconocido, asignación conservadora
         log_warning(kernel_logger, "Motivo de devolución desconocido: %s", motivo);
         planificador_corto_plazo();
     }
@@ -2381,6 +2529,8 @@ void establecer_pid_proceso_actual(int pid) {
  */
 void finalizar_proceso_actual() {
     int pid = obtener_pid_proceso_actual();
+    log_trace(kernel_logger, "[DEBUG] finalizar_proceso_actual() - PID obtenido: %d", pid);
+    
     if (pid == -1) {
         log_warning(kernel_logger, "No hay proceso actual para finalizar");
         return;
@@ -2389,7 +2539,10 @@ void finalizar_proceso_actual() {
     log_info(kernel_logger, "Finalizando proceso actual PID=%d", pid);
     
     // Remover de todas las colas
+    log_trace(kernel_logger, "[DEBUG] finalizar_proceso_actual() - Intentando lock mutex_cola_exec");
     pthread_mutex_lock(&mutex_cola_exec);
+    log_trace(kernel_logger, "[DEBUG] finalizar_proceso_actual() - Lock mutex_cola_exec obtenido");
+    
     for (int i = 0; i < list_size(cola_exec); i++) {
         t_pcb* proceso = list_get(cola_exec, i);
         if (proceso != NULL && proceso->pid == pid) {
@@ -2399,15 +2552,21 @@ void finalizar_proceso_actual() {
             break;
         }
     }
+    log_trace(kernel_logger, "[DEBUG] finalizar_proceso_actual() - Desbloqueando mutex_cola_exec");
     pthread_mutex_unlock(&mutex_cola_exec);
     
     // Liberar CPU
+    log_trace(kernel_logger, "[DEBUG] finalizar_proceso_actual() - Intentando lock mutex_cpus");
     pthread_mutex_lock(&mutex_cpus);
+    log_trace(kernel_logger, "[DEBUG] finalizar_proceso_actual() - Lock mutex_cpus obtenido");
+    
     if (lista_cpus_conectadas != NULL) {
         for (int i = 0; i < list_size(lista_cpus_conectadas); i++) {
             t_cpu_conectada* cpu = list_get(lista_cpus_conectadas, i);
             if (cpu != NULL && cpu->proceso_en_exec != NULL && 
                 cpu->proceso_en_exec->pid == pid) {
+                log_trace(kernel_logger, "[DEBUG] Liberando CPU %d que ejecutaba proceso PID=%d", 
+                         cpu->id_cpu, pid);
                 cpu->esta_libre = true;
                 cpu->proceso_en_exec = NULL;
                 log_info(kernel_logger, "CPU %d liberada por finalización de proceso PID=%d", 
@@ -2416,7 +2575,9 @@ void finalizar_proceso_actual() {
             }
         }
     }
+    log_trace(kernel_logger, "[DEBUG] finalizar_proceso_actual() - Desbloqueando mutex_cpus");
     pthread_mutex_unlock(&mutex_cpus);
+    log_trace(kernel_logger, "[DEBUG] finalizar_proceso_actual() - FINALIZADO exitosamente");
 }
 
 /**

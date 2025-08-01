@@ -509,6 +509,11 @@ void* planificar_con_plp(t_proceso_kernel* proceso) {
 
 void* planificar_procesos_en_new(){
     while (1) {
+        if (plani_lp == NULL) {
+            log_error(kernel_logger, "## ERROR: plani_lp es NULL en planificar_procesos_en_new. Esperando inicialización...");
+            sleep(1);
+            continue;
+        }
         if(string_equals_ignore_case(plani_lp->estado, "INICIADO")) {
             pthread_mutex_lock(&mutex_cola_new);
             pthread_mutex_lock(&mutex_cola_susp_ready);
@@ -523,10 +528,9 @@ void* planificar_procesos_en_new(){
                 }
                 
                 if (string_equals_ignore_case(ALGORITMO_INGRESO_A_READY, "FIFO")) {
-                    // FIFO: Intentar pasar el primer proceso
+                    // FIFO: Intentar pasar el primer proceso (mutex ya tomado)
                     t_proceso_kernel* primer_proceso = list_get(cola_new, 0);
-                    intentar_pasar_a_ready(primer_proceso);
-                    
+                    intentar_pasar_a_ready_interno(primer_proceso);
                     // Si no pudo pasar, detener procesamiento hasta que se libere espacio
                     if (primer_proceso->estado != ESTADO_READY) {
                         pthread_mutex_unlock(&mutex_cola_new);
@@ -535,17 +539,16 @@ void* planificar_procesos_en_new(){
                         continue;
                     }
                 } else if (string_equals_ignore_case(ALGORITMO_INGRESO_A_READY, "PMCP")) {
-                    // PMCP: Intentar pasar procesos ordenados por tamaño
+                    // PMCP: Intentar pasar procesos ordenados por tamaño (mutex ya tomado)
                     bool algun_proceso_paso = false;
                     for (int i = 0; i < list_size(cola_new); i++) {
                         t_proceso_kernel* proceso = list_get(cola_new, i);
-                        intentar_pasar_a_ready(proceso);
+                        intentar_pasar_a_ready_interno(proceso);
                         if (proceso->estado == ESTADO_READY) {
                             algun_proceso_paso = true;
                             i--; // Ajustar índice ya que se removió un elemento
                         }
                     }
-                    
                     if (!algun_proceso_paso) {
                         pthread_mutex_unlock(&mutex_cola_new);
                         pthread_mutex_unlock(&mutex_cola_susp_ready);

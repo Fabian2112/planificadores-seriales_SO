@@ -31,6 +31,8 @@ int fd_kernel_dispatch = -1;
 int fd_kernel_interrupt = -1;
 int fd_memoria = -1;
 
+t_pcb pcb_en_ejecucion = {0};
+
 
 void inicializar_cpu(){
     inicializar_logs();
@@ -148,12 +150,12 @@ int main(int argc, char* argv[]) {
 
 
     // Enviar identificador al Kernel
-    log_info(cpu_logger, "Enviando identificador '%s' al Kernel", identificador_cpu);
+    /*log_info(cpu_logger, "Enviando identificador '%s' al Kernel", identificador_cpu);
     t_paquete* paquete_identificador = crear_paquete(CPU, cpu_logger);
     agregar_a_paquete(paquete_identificador, identificador_cpu, strlen(identificador_cpu) + 1);
     enviar_paquete(paquete_identificador, fd_kernel_dispatch);
     enviar_paquete(paquete_identificador, fd_kernel_interrupt);
-    eliminar_paquete(paquete_identificador);
+    eliminar_paquete(paquete_identificador);*/
 
     // Inicializar caché
     log_info(cpu_logger, "Inicializando caché con %d entradas y algoritmo %s", ENTRADAS_CACHE, REEMPLAZO_CACHE);
@@ -176,7 +178,7 @@ int main(int argc, char* argv[]) {
 
     log_debug(cpu_logger,"Se ha desconectado de cpu");
 
-	printf("\nCPU DESCONECTADO!\n\n");
+    printf("\nCPU DESCONECTADO!\n\n");
 
     finalizar_MMU();  // Del código cpu
     return EXIT_SUCCESS;
@@ -214,6 +216,7 @@ void iniciar_cpu(int conexion_memoria, int conexion_dispatch, int conexion_inter
             continue;
         }
         
+        pcb_en_ejecucion = pcb;
         log_info(cpu_logger, "Proceso recibido - PID: %d - PC: %d", pcb.pid, pcb.pc);
         
         // 2. Ciclo de ejecución de instrucciones
@@ -349,13 +352,13 @@ void* conectar_kernel_dispatch(void* arg) {
         t_paquete* paquete = crear_paquete(SYSCALL, cpu_logger);
         agregar_a_paquete(paquete, syscall_a_procesar, strlen(syscall_a_procesar) + 1);
         
-        log_info(cpu_logger, "Enviando syscall al Kernel: %s", syscall_a_procesar);
+        log_info(cpu_logger, "Antes de enviar_paquete");
         enviar_paquete(paquete, fd_kernel_dispatch);
-        eliminar_paquete(paquete);
+        log_info(cpu_logger, "Después de enviar_paquete");
         
-        // Esperar respuesta del kernel
         log_info(cpu_logger, "Esperando confirmación del Kernel para syscall: %s", syscall_a_procesar);
         int cod_op = recibir_operacion(cpu_logger, fd_kernel_dispatch);
+        log_info(cpu_logger, "Respuesta recibida del Kernel: %d", cod_op);
         
         // Procesar respuesta
         bool syscall_exitosa = false;
@@ -487,15 +490,15 @@ void* conectar_cpu_memoria(void* arg) {
         sem_post(&sem_archivo_listo_solicitado);
 
         // Llamar a la función recibir_instruccion para manejar la recepción de instrucciones
-        recibir_instruccion(fd_memoria);
+        //recibir_instruccion(fd_memoria);
     } else {
         log_error(cpu_logger, "Se esperaba ARCHIVO_LISTO pero se recibió: %d", cod_op);
         close(fd_memoria);
     }
             
     // Solo cerrar si no se procesaron instrucciones correctamente
-    log_info(cpu_logger, "Desconectado de Memoria");
-    return NULL;
+    //log_info(cpu_logger, "Desconectado de Memoria");
+    //return NULL;
 }
 
 
@@ -604,7 +607,6 @@ void recibir_instruccion(int fd_memoria) {
 
 void procesar_instruccion(char* instruccion) {
     log_info(cpu_logger, "Procesando instrucción: %s", instruccion);
-
     // Verificar si es una syscall
     if(es_syscall(instruccion)) {
         syscall_en_proceso = true;
@@ -642,9 +644,47 @@ void procesar_instruccion(char* instruccion) {
                 sleep(1);
                 break;
             case WRITE:
-                printf("CPU > Ejecutando WRITE en dirección %d\n", instruction.direccion);
+                /*printf("CPU > Ejecutando WRITE en dirección %d\n", instruction.direccion);
                 sleep(1);
-                break;
+                break;*/
+                log_info(cpu_logger, "## PID: %d - Ejecutando: WRITE - %d %s", 
+                    pcb_en_ejecucion.pid, instruction.direccion, instruction.datos);
+
+            int tamanio_pagina = config_get_int_value(cpu_config, "TAMANIO_PAGINA");
+            int nro_pagina = instruction.direccion / tamanio_pagina;
+            int offset = instruction.direccion % tamanio_pagina;
+            
+            if (cache_habilitada()) {
+                if (escribir_en_cache(nro_pagina, pcb_en_ejecucion.pid, offset, instruction.datos, strlen(instruction.datos) + 1)) {
+                    log_info(cpu_logger, "PID: %d - ESCRIBIR en caché - Página: %d, Offset: %d", 
+                            pcb_en_ejecucion.pid, nro_pagina, offset);
+                    break;
+                }
+                
+                int* direccion_fisica = obtener_direccion_fisica_con_cache(instruction.direccion, pcb_en_ejecucion.pid, fd_memoria);
+                if (!direccion_fisica) {
+                    log_error(cpu_logger, "PID: %d - Error en traducción de dirección: %d", 
+                             pcb_en_ejecucion.pid, instruction.direccion);
+                    return PROCESS_EXIT;
+                }
+                
+                if (escribir_en_cache(nro_pagina, pcb_en_ejecucion.pid, offset, instruction.datos, strlen(instruction.datos) + 1)) {
+                    log_info(cpu_logger, "PID: %d - ESCRIBIR en caché (después de cargar) - Página: %d, Offset: %d", 
+                            pcb_en_ejecucion.pid, nro_pagina, offset);
+                } else {
+                    escribir_en_memoria_simple(direccion_fisica, instruction.datos, strlen(instruction.datos) + 1, fd_memoria, pcb_en_ejecucion.pid);
+                }
+            } else {
+                int* direccion_fisica = obtener_direccion_fisica(instruction.direccion, pcb_en_ejecucion.pid, fd_memoria);
+                if (!direccion_fisica) {
+                    log_error(cpu_logger, "PID: %d - Error en traducción de dirección: %d", 
+                             pcb_en_ejecucion.pid, instruction.direccion);
+                    return PROCESS_EXIT;
+                }
+                escribir_en_memoria_simple(direccion_fisica, instruction.datos, strlen(instruction.datos) + 1, fd_memoria, pcb_en_ejecucion.pid);
+            }
+            break;
+        
             case READ:
                 printf("CPU > Ejecutando READ en dirección %d\n", instruction.direccion);
                 sleep(1);
@@ -736,32 +776,159 @@ t_instruccion decode_instruction(char* instruction_string) {
 
 
 char* fetch_instruction(t_pcb* pcb, int conexion_memoria) {
-    log_info(cpu_logger, "PID: %d - FETCH - Program Counter: %d", pcb->pid, pcb->pc);
+    /*log_info(cpu_logger, "PID: %d - FETCH - Program Counter: %d", pcb->pid, pcb->pc);
+
+        // Crear paquete de solicitud
+        t_paquete* paquete_solicitud = crear_paquete(SOLICITUD_INSTRUCCION, cpu_logger);
+        agregar_a_paquete(paquete_solicitud, &(pcb->pid), sizeof(pcb->pid));
+        agregar_a_paquete(paquete_solicitud, &(pcb->pc), sizeof(pcb->pc));
+
+        log_info(cpu_logger, "== DEBUG - Se creó el paquete");
+        // Enviar solicitud a memoria
+        enviar_paquete(paquete_solicitud, conexion_memoria);
+        log_info(cpu_logger, "== DEBUG - Se envió el paquete");
+        eliminar_paquete(paquete_solicitud);
+
+        usleep(1000);
+        int cod_op = recibir_operacion(cpu_logger, conexion_memoria);
+        log_debug(cpu_logger, "FETCH: cod_op recibido: %d", cod_op);
+        if (cod_op == 0) {
+            log_warning(cpu_logger, "FETCH: cod_op == 0, reintentando solicitud de instrucción");
+            sleep(1);
+        }
     
-    // Crear paquete de solicitud
-    t_paquete* paquete_solicitud = crear_paquete(SOLICITUD_INSTRUCCION, cpu_logger);
-    agregar_a_paquete(paquete_solicitud, &(pcb->pid), sizeof(pcb->pid));
-    agregar_a_paquete(paquete_solicitud, &(pcb->pc), sizeof(pcb->pc));
-    
-    // Enviar solicitud a memoria
-    enviar_paquete(paquete_solicitud, conexion_memoria);
-    eliminar_paquete(paquete_solicitud);
-    
-    // Recibir tamaño de la instrucción
-    uint32_t instruction_size;
-    if (!recibir_datos(conexion_memoria, &instruction_size, sizeof(instruction_size))) {
+
+    if (cod_op == PAQUETE) {
+        t_list* lista = recibir_paquete_desde_buffer(cpu_logger, conexion_memoria);
+        if (!lista) {
+            log_error(cpu_logger, "FETCH: lista nula recibida desde memoria");
+            return NULL;
+        }
+        int tam_lista = list_size(lista);
+        log_debug(cpu_logger, "FETCH: tamaño de lista recibida: %d", tam_lista);
+        if (tam_lista > 0) {
+            char* instruccion = list_get(lista, 0);
+            if (!instruccion) {
+                log_error(cpu_logger, "FETCH: instrucción nula en la lista");
+                list_destroy_and_destroy_elements(lista, free);
+                return NULL;
+            }
+            log_info(cpu_logger, "FETCH: instrucción recibida: '%s'", instruccion);
+            // Copiar instrucción para liberar lista correctamente
+            char* copia = strdup(instruccion);
+            list_destroy_and_destroy_elements(lista, free);
+            return copia;
+        } else {
+            log_error(cpu_logger, "FETCH: lista vacía recibida desde memoria");
+            list_destroy_and_destroy_elements(lista, free);
+            return NULL;
+        }
+    } else {
+        log_error(cpu_logger, "FETCH: código de operación inesperado: %d", cod_op);
         return NULL;
+    } */
+   if(conexion_memoria <= 0) {
+        log_error(cpu_logger, "Descriptor de archivo inválido");
+        return;
     }
+
+    log_info(cpu_logger, "Iniciando recepción de instrucciones desde Memoria");
+    bool continuar = true;
+
+    // Esperar a que el archivo esté listo
+    sem_wait(&sem_archivo_listo_solicitado);
     
-    // Recibir la instrucción
-    char* instruction = malloc(instruction_size + 1);
-    if (!recibir_datos(conexion_memoria, instruction, instruction_size)) {
-        free(instruction);
-        return NULL;
+    int cod_op;
+    if (recv(conexion_memoria, &cod_op, sizeof(int), MSG_WAITALL) <= 0) {
+        log_error(cpu_logger, "Error al recibir señal inicial desde Memoria");
+        return;
     }
-    instruction[instruction_size] = '\0';
-    
-    return instruction;
+
+    if (cod_op != ARCHIVO_LISTO) {
+        log_error(cpu_logger, "Código recibido inesperado: %d", cod_op);
+        return;
+    }
+    while(continuar) {
+        
+        // Verificar si hay syscall en proceso
+        if(syscall_en_proceso) {
+            log_info(cpu_logger, "Syscall en proceso, esperando...");
+            sleep(1);
+            continue;
+        }
+
+        // Solicitar instrucción de forma thread-safe
+        pthread_mutex_lock(&mutex_comunicacion_memoria);
+        
+        log_info(cpu_logger, "Enviando SOLICITUD_INSTRUCCION (cod_op: %d)", SOLICITUD_INSTRUCCION);
+
+        t_paquete* paquete = crear_paquete(SOLICITUD_INSTRUCCION, cpu_logger);
+        enviar_paquete(paquete, conexion_memoria);
+        eliminar_paquete(paquete);
+
+        log_info(cpu_logger, "SOLICITUD_INSTRUCCION enviada");
+        
+        sleep(1); // Simular retardo de memoria
+
+        // Esperar respuesta de Memoria directamente
+        int cod_op = recibir_operacion(cpu_logger, fd_memoria);
+        log_info(cpu_logger, "Recibido cod_op: %d", cod_op);
+
+        pthread_mutex_unlock(&mutex_comunicacion_memoria);
+
+        if(cod_op <= 0) {
+        log_warning(cpu_logger, "Error en código de operación recibido: %d", cod_op);
+        if(cod_op == 0) {
+            log_info(cpu_logger, "Reintentando solicitud de instrucción...");
+            continue;
+        } else {
+        break;
+        }
+        }
+
+        switch(cod_op) {
+            case PAQUETE: {
+                log_info(cpu_logger, "Recibiendo paquete de instrucción");
+                
+                t_list* lista = recibir_paquete_desde_buffer(cpu_logger, conexion_memoria);
+                
+                if (lista == NULL || list_size(lista) == 0) {
+                    log_error(cpu_logger, "Lista vacía recibida");
+                    if (lista) list_destroy(lista);
+                    continue;
+                }
+                
+                char* instruccion = list_get(lista, 0);
+                
+                if (instruccion == NULL || strlen(instruccion) == 0) {
+                    log_error(cpu_logger, "Instrucción vacía");
+                    list_destroy_and_destroy_elements(lista, free);
+                    continue;
+                }
+                
+                log_info(cpu_logger, "Ejecutando: %s", instruccion);
+                return instruccion;
+                // Procesar instrucción
+                //procesar_instruccion(instruccion);
+                
+                // Limpiar recursos
+                //list_destroy_and_destroy_elements(lista, free);
+                
+                //log_info(cpu_logger, "Instrucción procesada");
+                //break;
+            }
+            default:
+                log_warning(cpu_logger, "Código de operación no reconocido: %d", cod_op);
+                return NULL;
+            break;
+        }
+
+        // Pequeña pausa para no saturar el sistema
+        sleep(1);
+    }
+    // Cerrar la conexión cuando terminamos
+    close(fd_memoria);
+    log_info(cpu_logger, "Finalizada recepción de instrucciones desde Memoria");
 }
 
 
@@ -936,7 +1103,7 @@ void free_instruction(t_instruccion* instruction) {
 
 ExecutionResult ciclo_instruccion(t_pcb* pcb, int conexion_memoria, int conexion_interrupt) {
     // FETCH: Obtener la próxima instrucción
-    char* instruction_string = fetch_instruction(pcb, conexion_memoria);
+    /*char* instruction_string = fetch_instruction(pcb, conexion_memoria);
     if (!instruction_string) {
         log_error(cpu_logger, "PID: %d - Error en FETCH", pcb->pid);
         return PROCESS_EXIT;
@@ -966,8 +1133,10 @@ ExecutionResult ciclo_instruccion(t_pcb* pcb, int conexion_memoria, int conexion
     if (result == CONTINUE_EXECUTION && check_interrupt(conexion_interrupt, pcb->pid)) {
         return INTERRUPT_RECEIVED;
     }
-    
-    return result;
+        return result;
+    */
+    recibir_instruccion(conexion_memoria);
+    return CONTINUE_EXECUTION;
 }
 
 bool recibir_pcb(int socket, t_pcb* pcb) {

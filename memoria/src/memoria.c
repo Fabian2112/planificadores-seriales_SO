@@ -835,7 +835,7 @@ void procesar_envio_archivo_kernel(int fd_kernel) {
         log_info(memoria_logger, "Archivo: %s, Tamaño proceso: %d", nombre_archivo, tamanio_proceso);
 
         char path_completo[256];
-        snprintf(path_completo, sizeof(path_completo), "../utils/pruebas/revenge-of-the-cth-pruebas/%s", nombre_archivo);
+        snprintf(path_completo, sizeof(path_completo), "../../utils/pruebas/revenge-of-the-cth-pruebas/%s", nombre_archivo);
 
         // Caso especial para tamaño 0
         if (tamanio_proceso == 0) {
@@ -1005,7 +1005,9 @@ void procesar_envio_archivo_kernel(int fd_kernel) {
         log_info(memoria_logger, "Enviando confirmación de carga de archivo a kernel");
         send(fd_kernel, &confirmacion, sizeof(bool), 0);
 
+        log_info(memoria_logger, "Liberando semáforo sem_archivo_listo con sem_post...");
         sem_post(&sem_archivo_listo);
+        log_info(memoria_logger, "Semáforo sem_archivo_listo liberado.");
 
     } else {
         log_warning(memoria_logger, "Paquete incompleto recibido de kernel");
@@ -1390,11 +1392,11 @@ bool procesar_solicitud_instruccion(int fd_cpu) {
         pthread_mutex_unlock(&mutex_archivo_solicitud_instruccion);
         
         // Enviar error a CPU
-        t_paquete* paquete_error = crear_paquete(ERROR, memoria_logger);
-        agregar_a_paquete(paquete_error, "Archivo no disponible", 20);
-        enviar_paquete(paquete_error, fd_cpu);
-        eliminar_paquete(paquete_error);
-     
+        //t_paquete* paquete_error = crear_paquete(ERROR, memoria_logger);
+        //agregar_a_paquete(paquete_error, "Archivo no disponible", 20);
+        //enviar_paquete(paquete_error, fd_cpu);
+        //eliminar_paquete(paquete_error);
+        send(fd_cpu, ERROR, sizeof(int), 0);
         return false;
     }
         
@@ -1520,7 +1522,9 @@ void* atender_memoria_cpu(void* arg) {
 
     log_info(memoria_logger, "Esperando archivo de Instrucciones de Kernel...");
 
+    log_info(memoria_logger, "Esperando semáforo sem_archivo_listo...");
     sem_wait(&sem_archivo_listo);
+    log_info(memoria_logger, "Semáforo sem_archivo_listo liberado, continuando.");
 
     // Dar tiempo para sincronización
     usleep(100000); // 100ms
@@ -1540,6 +1544,7 @@ void* atender_memoria_cpu(void* arg) {
 
         log_debug(memoria_logger, "Estado actual Contador: %d", contador);
 
+        
         // Esperar nueva solicitud de CPU
         int cod_op = recibir_operacion(memoria_logger, fd_cpu);
         log_info(memoria_logger, "Recibiendo operacion de CPU con cod_op: %d", cod_op);

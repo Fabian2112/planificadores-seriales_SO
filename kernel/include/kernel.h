@@ -23,7 +23,6 @@
 #define HANDSHAKE 200
 #define MODULO_KERNEL 0
 #define KERNEL 0
-#define SYSCALL 42
 #define SYSCALL_OK 43
 #define SYSCALL_ERROR 44
 #define PCB_DEVUELTO 201

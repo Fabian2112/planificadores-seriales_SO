@@ -105,7 +105,7 @@ extern sem_t sem_procesamiento_libre; // Sincronización para indicar que el pro
 extern sem_t sem_syscall_procesada; // Sincronización para indicar que una syscall ha sido procesada
 extern sem_t sem_io_completada; // Sincronización para indicar que una operación de I/O ha sido completada
 extern sem_t *sem_respuesta_memoria; // Semáforo para indicar que Memoria ha respondido a una solicitud de instrucción
-
+extern sem_t sem_instruccion_finalizada;
 // Códigos de operación para identificación de módulos
 typedef enum {
     KERNEL,

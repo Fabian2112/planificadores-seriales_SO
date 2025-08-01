@@ -64,6 +64,7 @@ sem_t sem_procesamiento_libre; // Sincronización para indicar que el procesamie
 sem_t sem_syscall_procesada; // Sincronización para indicar que una syscall ha sido procesada
 sem_t sem_io_completada; // Sincronización para indicar que una operación de I/O ha sido completada
 sem_t *sem_respuesta_memoria; // Semáforo para indicar que Memoria ha respondido a una solicitud de instrucción
+sem_t sem_instruccion_finalizada;
 
 
 void inicializar_sincronizacion() {
@@ -88,6 +89,7 @@ void inicializar_sincronizacion() {
     pthread_mutex_init(&mutex_marcos, NULL);
     pthread_mutex_init(&mutex_procesos, NULL); // Mutex para acceso a procesos activos y suspendidos
     pthread_mutex_init(&mutex_io_activas, NULL);
+    pthread_mutex_init(&mutex_syscall_kernel, NULL);
 }
 
 void destruir_sincronizacion() {
